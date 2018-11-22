@@ -1,6 +1,6 @@
 import sys, time, re, os, sys
 from splunklib.searchcommands import dispatch, GeneratingCommand, Configuration, Option, validators
-from datetime import datetime
+from datetime import datetime, timedelta
 import dateutil.parser
 from itertools import chain
 import backports.configparser as configparser
@@ -27,6 +27,9 @@ class MongoConnectCommand(GeneratingCommand):
     s = Option(require=False)
     db = Option(require=False, default='test') 
     col = Option(require=False, default='tweets') 
+    earliest = Option(require=False, default=(datetime.now() - timedelta(hours=4)).strftime("%x %X"))
+    latest = Option(require=False, default=datetime.now().strftime("%x %X"))
+    limit = Option(require=False, default=10, validate=validators.Integer())
 
     _mongo_conf = configparser.ConfigParser()
     _mongo_conf.read(os.path.dirname(__file__) + '/../default/mongo.conf')
@@ -109,6 +112,25 @@ class MongoConnectCommand(GeneratingCommand):
         self.database = self._client[self.db]
         #self.collection = self.database[self.col]
 
+    def flatten(self, _dict, key=""):
+        if key != "":
+            key = key + '_'
+        for k,v in _dict.items():
+            if isinstance(v, list):
+                for elt in v:
+                    if isinstance(elt, dict):
+                        for k2,v2 in self.flatten(elt, key + k):
+                            yield k2,v2
+                    else:
+                        yield key + k,elt
+            elif isinstance(v, dict):
+                for k2,v2 in self.flatten(v, key + k):
+                    yield k2,v2
+            else:
+                if k != 'id' and k != 'id_str':
+                    yield key + k,v
+
+
     def generate(self):
         self.init()
 
@@ -118,26 +140,46 @@ class MongoConnectCommand(GeneratingCommand):
         q = {}
         if self.s:
             q = { '$text': { '$search': self.s } }
+        q['_time'] = {}
+        q['_time']['$gte'] = dateutil.parser.parse(self.earliest)
+        q['_time']['$lte'] = dateutil.parser.parse(self.latest)
+        s = [ ('_time', -1) ]
         collections = self.col.split(',')
         for collection in collections:
-            for doc in self.database[collection].find(q):
+            for doc in self.database[collection].find(q).sort(s).limit(self.limit):
                 ret = {}
                 try:
                     try:
-                        for date in self.find_dates(doc['_time'], allow_overlapping=False):
-                            ret['_time'] = date.strftime("%s.%f")
-                            #break
+                        if '_time' in doc:
+                            ret['_time'] = doc['_time'].strftime("%s.%f")
+                            del doc['_time']
+                        else: 
+                            for datefield in self._mongo_conf['fields']['DateFields'].split(','):
+                                if datefield in doc:
+                                    for date in self.find_dates(doc[datefield], allow_overlapping=False):
+                                        ret['_time'] = date.strftime("%s.%f")
+                                        break
+                                    if '_time' in ret:
+                                        break
                     except Exception as e:
+                        #print("ERROR: ", str(e))
                         ret['_raw'] = "Error: %s." % str(e)
-                        #break
                     if not '_time' in ret:
                         ret['_time'] = time.time()
+                    #print(ret['_time'])
                     ret['_raw'] = str(doc['message']) if 'message' in doc else dumps(doc)
-                    ret['source'] = doc['source'] if 'source' in doc else self.col
-                    ret['sourcetype'] = doc['sourcetype'] if 'sourcetype' in doc else 'legacy'
+                    if 'source' in doc:
+                        del doc['source']
+                    ret['source'] = doc['_source'] if '_source' in doc else self.db
+                    if 'sourcetype' in doc:
+                        del doc['sourcetype']
+                    ret['sourcetype'] = doc['_sourcetype'] if '_sourcetype' in doc else self.col
                     sourcetype = ret['sourcetype']
-                    for field in doc:
-                        ret[field] = doc[field]
+                    #for field in doc:
+                    #    ret[field] = doc[field]
+                    for field, value in self.flatten(doc):
+                        #print("KV: ", field, value)
+                        ret[field] = value #doc[field]
                     for (field, value) in self.kv.findall(ret['_raw']):
                         ret[field] = value.replace('"', '')
                     if sourcetype in self._extracts:
